@@ -73,6 +73,18 @@ function currentProject() {
 
 // ---------- Claude ----------
 
+// On Windows, `claude` on PATH is a .cmd shim that spawn() can't run directly,
+// so when claudePath isn't set, look for the real claude.exe in the usual install spots.
+function claudeCommand() {
+  if (config.claudePath && config.claudePath !== "claude") return config.claudePath;
+  if (process.platform !== "win32") return "claude";
+  const candidates = [
+    path.join(process.env.APPDATA || "", "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+    path.join(process.env.USERPROFILE || "", ".local", "bin", "claude.exe"),
+  ];
+  return candidates.find((c) => fs.existsSync(c)) || "claude";
+}
+
 // Runs one Claude turn. Resolves as soon as the final result arrives
 // (the CLI takes another ~1.5s to exit, which we don't wait for).
 function runClaude(project, text, resume) {
@@ -91,7 +103,7 @@ function runClaude(project, text, resume) {
     delete env.CLAUDECODE; // allow running even if the server was started from inside Claude Code
     delete env.ANTHROPIC_API_KEY; // always use the Pro login, never a pay-per-use key
 
-    const child = spawn(config.claudePath || "claude", args, { cwd: project.path, env, windowsHide: true });
+    const child = spawn(claudeCommand(), args, { cwd: project.path, env, windowsHide: true });
     let pending = "", stderr = "", done = false;
     const finish = (result) => {
       if (done) return;
