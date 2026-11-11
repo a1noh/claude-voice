@@ -258,4 +258,11 @@ http.createServer(async (req, res) => {
   } finally {
     busy.delete(project.name);
   }
-}).listen(config.port || 8787, "127.0.0.1", () => console.log(`voice-claude listening on http://127.0.0.1:${config.port || 8787}`));
+})
+  .on("error", (e) => {
+    // e.g. EADDRINUSE: another copy is already running. Wait before exiting so a
+    // launcher that restarts us doesn't spin.
+    console.error(`server error: ${e.message}`);
+    setTimeout(() => process.exit(1), 60000);
+  })
+  .listen(config.port || 8787, "127.0.0.1", () => console.log(`voice-claude listening on http://127.0.0.1:${config.port || 8787}`));

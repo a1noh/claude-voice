@@ -202,14 +202,20 @@ Only do this in projects that use **git**, so you can review and undo changes at
 
 ## Keep it running (optional)
 
-The server must be running for the Shortcut to work. To start it automatically when you log in on Windows:
+The server must be running for the Shortcut to work.
 
-```bat
-schtasks /create /tn "Claude Voice" /sc onlogon /tr "node C:\full\path\to\claude-voice\server.js"
-```
+**Windows:** `start-hidden.vbs` runs the server with no window and restarts it within a few seconds if it ever stops.
+To start it automatically when you log in:
+
+1. Press **Win + R**, type `shell:startup`, press Enter. A folder opens.
+2. Right-click `start-hidden.vbs` → **Show more options → Create shortcut**, and move the shortcut into that folder.
+3. Double-click it once to start it now.
+
+To stop it, end **Windows Script Host** and **Node.js** in Task Manager. Tailscale already starts with Windows,
+and `tailscale serve --bg` is remembered.
 
 Also make sure the computer doesn't go to sleep while you want to use it
-(**Settings → System → Power → Screen and sleep**).
+(**Settings → System → Power → Screen and sleep → When plugged in, put my device to sleep after: Never**).
 
 On macOS or Linux, use `launchd`, `systemd`, or something like `pm2`.
 
