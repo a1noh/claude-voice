@@ -24,7 +24,7 @@ and reaches your phone privately through [Tailscale](https://tailscale.com).
 - **Native iPhone voice.** Uses iPhone's built-in dictation and voice through Shortcuts.
   No app to install, and mic permission is asked only once.
 
-A typical answer starts playing about 5 seconds after you stop talking.
+A typical answer starts playing about 3 seconds after you stop talking.
 
 ---
 
@@ -229,6 +229,7 @@ Edits take longer than questions (about 10–20 seconds).
 | `model` | `sonnet` | Claude model (`sonnet`, `opus`, `haiku`, …) |
 | `effort` | `low` | Thinking effort: `low` is fastest; raise it for harder questions |
 | `timeoutSeconds` | `300` | Give up on a question after this long |
+| `idleMinutes` | `20` | Close a project's background Claude Code after this long unused (frees memory) |
 | `claudePath` | auto | Path to the `claude` executable, only if it isn't found automatically |
 
 ---
@@ -265,7 +266,7 @@ On macOS or Linux, use `launchd`, `systemd`, or something like `pm2`.
 | It **cut me off** | Set Dictate Text → Stop Listening to **On Tap**. |
 | It talks **too fast** | Speak Text → drag **Rate** left. |
 | "I'm still working on your last question" | Claude is still answering the previous one. Wait a moment and ask again. |
-| Answers are **slow** | Short questions take about 5 seconds. Questions that make Claude read many files take longer. Keep `effort` at `low`. |
+| Answers are **slow** | Short questions take about 3 seconds (the first one after a pause about 4–5). Questions that make Claude read many files take longer. Keep `effort` at `low`. |
 
 Logs live in `logs/`: `server.log` (requests, timings, errors) and `conversations.log` (questions and answers).
 
@@ -283,7 +284,7 @@ Logs live in `logs/`: `server.log` (requests, timings, errors) and `conversation
 
 ## Limitations
 
-- **Waits for the full answer** before speaking (Shortcuts can't stream). Short answers take about 5 seconds.
+- **Waits for the full answer** before speaking (Shortcuts can't stream). Short answers take about 3 seconds.
 - **One question per press.** Press again for a follow-up; it remembers the conversation.
 - **English and Korean** built in. Other languages need a new entry in `LANGUAGE_PROMPT` and `MSG` in `server.js`.
 - Every question uses your Claude plan's usage, like any Claude Code message.
@@ -293,11 +294,12 @@ Logs live in `logs/`: `server.log` (requests, timings, errors) and `conversation
 ## How it works
 
 1. The Shortcut dictates your speech and POSTs `{"text": "..."}` to `/api/shortcut`.
-2. `server.js` checks the Tailscale identity header, handles voice commands, and otherwise runs:
-   `claude -p --resume <session> --append-system-prompt "<reply in 1-3 short spoken sentences>"`
-   in the current project's folder.
+2. `server.js` checks the Tailscale identity header and handles voice commands. Questions go to a
+   **Claude Code process kept open for that project** (`claude -p --input-format stream-json --resume <session>`),
+   so each answer skips Claude Code's ~2 second startup. It's opened ahead of time when the server starts or you
+   switch projects, replaced when the language or settings change or if it crashes, and closed after `idleMinutes` idle.
 3. The reply comes back as plain text, and the Shortcut speaks it.
-4. The session id is saved in `state.json`, so the next question continues the same conversation.
+4. The session id is saved in `state.json`, so the conversation continues even after a restart.
    If a saved conversation can't be resumed, it starts a fresh one automatically.
 
 ## License

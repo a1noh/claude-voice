@@ -210,64 +210,136 @@ function unpublished(project) {
   try { return git(project, ["log", "@{u}..HEAD", "--format=%s"]).split("\n").filter(Boolean); } catch { return null; }
 }
 
-// Runs one Claude turn. Resolves as soon as the final result arrives
-// (the CLI takes another ~1.5s to exit, which we don't wait for).
+// ---------- Claude workers ----------
+//
+// Starting Claude Code costs ~2 seconds, so each project keeps one Claude Code process
+// open in the background ("worker") and hands it one question after another over stdin
+// (--input-format stream-json). Settings that are fixed at launch (language, edit mode,
+// model, effort) are part of the worker's key: if one changes, the worker is replaced.
+// Answer length changes per question, so it travels with the question instead.
+
+const workers = new Map(); // project name -> worker
+
+function systemPrompt(project, lang) {
+  return SYSTEM_PROMPT + LANGUAGE_PROMPT[lang] + (canEdit(project)
+    ? " You may edit files in this project. Do not run git or other shell commands: the voice app saves each change " +
+      "automatically, the user says 'publish' to make saved changes live and 'undo' to reverse the last one. " +
+      "After any change, say in one sentence what you changed."
+    : " In this mode you can read files but cannot edit them or run commands. If asked to change something, " +
+      "say so plainly and describe the change instead of claiming you made it.");
+}
+
+const workerKey = (project, lang) =>
+  [project.path, lang, canEdit(project), config.model || "", config.effort || ""].join("|");
+
+function startWorker(project, lang, resume) {
+  const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                "--append-system-prompt", systemPrompt(project, lang),
+                "--permission-mode", canEdit(project) ? "acceptEdits" : "default"];
+  if (config.model) args.push("--model", config.model);
+  if (config.effort) args.push("--effort", config.effort);
+  if (resume) args.push("--resume", resume);
+
+  const env = { ...process.env };
+  delete env.CLAUDECODE; // allow running even if the server was started from inside Claude Code
+  delete env.ANTHROPIC_API_KEY; // always use the Pro login, never a pay-per-use key
+
+  const child = spawn(claudeCommand(), args, { cwd: project.path, env, windowsHide: true });
+  const worker = { child, key: workerKey(project, lang), project: project.name, turn: null, stderr: "", idleTimer: null, dead: false };
+  let pending = "";
+  child.stdout.on("data", (chunk) => {
+    pending += chunk;
+    let newline;
+    while ((newline = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, newline).trim();
+      pending = pending.slice(newline + 1);
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      if (msg.type === "result" && worker.turn) {
+        worker.turn({ ok: !msg.is_error, reply: String(msg.result || "").trim(), sessionId: msg.session_id });
+      }
+    }
+  });
+  child.stderr.on("data", (chunk) => { worker.stderr = (worker.stderr + chunk).slice(-2000); });
+  const died = (why) => {
+    if (worker.dead) return;
+    worker.dead = true;
+    clearTimeout(worker.idleTimer);
+    if (workers.get(project.name) === worker) workers.delete(project.name);
+    // Exiting in the middle of a question means the CLI itself failed (bad resume id, auth, crash).
+    if (worker.turn) {
+      console.error(`  claude failed (${why}): ${worker.stderr.trim().slice(-500)}`);
+      worker.turn({ ok: false, crashed: true, reply: MSG[lang].crashed });
+    }
+  };
+  child.on("error", (e) => died(e.message));
+  child.on("exit", (code) => died(`exit ${code}`));
+  child.stdin.on("error", () => {}); // writing to a worker that just died is handled by died()
+  workers.set(project.name, worker);
+  console.log(`  started Claude for ${project.name} (${lang}${canEdit(project) ? ", edit" : ""})`);
+  return worker;
+}
+
+function stopWorker(projectName) {
+  const worker = workers.get(projectName);
+  if (!worker) return;
+  workers.delete(projectName);
+  worker.dead = true;
+  clearTimeout(worker.idleTimer);
+  try { worker.child.stdin.end(); } catch {}
+  setTimeout(() => { try { worker.child.kill(); } catch {} }, 3000);
+}
+
+// Returns a live worker with the right settings, starting one if needed.
+function getWorker(project, lang, resume) {
+  const existing = workers.get(project.name);
+  if (existing && !existing.dead && existing.key === workerKey(project, lang)) return existing;
+  stopWorker(project.name);
+  return startWorker(project, lang, resume);
+}
+
+// Starts a worker ahead of time so the launch cost isn't in the next question's wait.
+function prewarm(project) {
+  try {
+    if (!workers.has(project.name)) touchIdle(getWorker(project, language(), state.sessions[project.name]));
+  } catch (e) { console.error(`  prewarm failed: ${e.message}`); }
+}
+
+// Closes a worker after it has been idle a while, to free memory.
+function touchIdle(worker) {
+  clearTimeout(worker.idleTimer);
+  worker.idleTimer = setTimeout(() => {
+    console.log(`  closing idle Claude for ${worker.project}`);
+    stopWorker(worker.project);
+  }, (config.idleMinutes || 20) * 60000);
+}
+
+// Runs one question on the project's worker.
 // opts: { lang: "en" | "ko", length: "short" | "long" }
 function runClaude(project, text, resume, { lang, length }) {
   return new Promise((resolve) => {
-    const mode = canEdit(project) ? "acceptEdits" : "default";
-    const prompt = SYSTEM_PROMPT + LENGTH_PROMPT[length] + LANGUAGE_PROMPT[lang] + (mode === "acceptEdits"
-      ? " You may edit files in this project. Do not run git or other shell commands: the voice app saves each change " +
-        "automatically, the user says 'publish' to make saved changes live and 'undo' to reverse the last one. " +
-        "After any change, say in one sentence what you changed."
-      : " In this mode you can read files but cannot edit them or run commands. If asked to change something, say so plainly and describe the change instead of claiming you made it.");
-    const args = ["-p", "--output-format", "stream-json", "--verbose", "--append-system-prompt", prompt,
-                  "--permission-mode", mode];
-    if (config.model) args.push("--model", config.model);
-    if (config.effort) args.push("--effort", config.effort);
-    if (resume) args.push("--resume", resume);
-
-    const env = { ...process.env };
-    delete env.CLAUDECODE; // allow running even if the server was started from inside Claude Code
-    delete env.ANTHROPIC_API_KEY; // always use the Pro login, never a pay-per-use key
-
-    const child = spawn(claudeCommand(), args, { cwd: project.path, env, windowsHide: true });
-    let pending = "", stderr = "", done = false;
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
+    const worker = getWorker(project, lang, resume);
+    clearTimeout(worker.idleTimer);
     const timer = setTimeout(() => {
-      child.kill();
+      // A stuck worker can't take more questions; replace it next time.
+      stopWorker(project.name);
       finish({ ok: false, reply: MSG[lang].timeout });
     }, (config.timeoutSeconds || 300) * 1000);
-
-    child.stdout.on("data", (chunk) => {
-      pending += chunk;
-      let newline;
-      while ((newline = pending.indexOf("\n")) >= 0) {
-        const line = pending.slice(0, newline).trim();
-        pending = pending.slice(newline + 1);
-        let msg;
-        try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.type === "result") {
-          finish({ ok: !msg.is_error, reply: String(msg.result || "").trim(), sessionId: msg.session_id });
-        }
-      }
-    });
-    child.stderr.on("data", (chunk) => (stderr += chunk));
-    // No result line at all means the CLI itself failed (bad resume id, auth, crash).
-    // Details go to the log; the spoken reply stays short.
-    const crashed = (why) => {
-      if (done) return;
-      console.error(`  claude failed (${why}): ${stderr.trim().slice(-500)}`);
+    function finish(result) {
+      if (!worker.turn) return;
+      worker.turn = null;
+      clearTimeout(timer);
+      if (!worker.dead) touchIdle(worker);
+      resolve(result);
+    }
+    worker.turn = finish;
+    const content = `[Voice app: ${LENGTH_PROMPT[length].trim()}]\n${text}`;
+    try {
+      worker.child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
+    } catch (e) {
+      stopWorker(project.name);
       finish({ ok: false, crashed: true, reply: MSG[lang].crashed });
-    };
-    child.on("error", (e) => crashed(e.message));
-    child.on("close", (code) => crashed(`exit ${code}`));
-    child.stdin.end(text);
+    }
   });
 }
 
@@ -280,6 +352,7 @@ async function askClaude(project, text, opts) {
   // Claude-side errors (e.g. usage limit) keep the conversation and aren't retried.
   if (r.crashed && saved) {
     console.log(`  resume failed for ${project.name}, starting a fresh conversation`);
+    stopWorker(project.name);
     r = await runClaude(project, text, null, opts);
   }
   if (r.sessionId) {
@@ -307,6 +380,8 @@ function handleCommand(text) {
     const before = language();
     state.language = toKo ? "ko" : "en";
     saveState();
+    // The worker's language is fixed at launch, so restart it now rather than on the next question.
+    if (before !== state.language) { stopWorker(currentProject().name); prewarm(currentProject()); }
     return MSG[before].switchLanguage[state.language];
   }
 
@@ -369,6 +444,7 @@ function handleCommand(text) {
   const switchTo = (p) => {
     state.lastProject = p.name;
     saveState();
+    prewarm(p);
     return m.switched(spokenName(p));
   };
 
@@ -390,6 +466,7 @@ function handleCommand(text) {
     // A running question would write its session back afterwards and undo the reset.
     if (busy.has(currentProject().name)) return m.busyReset;
     delete state.sessions[currentProject().name];
+    stopWorker(currentProject().name);
     saveState();
     return m.reset;
   }
@@ -495,4 +572,7 @@ http.createServer(async (req, res) => {
     console.error(`server error: ${e.message}`);
     setTimeout(() => process.exit(1), 60000);
   })
-  .listen(config.port || 8787, "127.0.0.1", () => console.log(`voice-claude listening on http://127.0.0.1:${config.port || 8787}`));
+  .listen(config.port || 8787, "127.0.0.1", () => {
+    console.log(`voice-claude listening on http://127.0.0.1:${config.port || 8787}`);
+    prewarm(currentProject());
+  });
