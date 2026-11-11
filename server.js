@@ -9,7 +9,8 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
+const crypto = require("crypto");
+const { spawn, execFileSync } = require("child_process");
 
 const ROOT = __dirname;
 const CONFIG_PATH = path.join(ROOT, "config.json");
@@ -51,6 +52,15 @@ const MSG = {
     reset: "Okay, starting a fresh conversation.",
     switchLanguage: { ko: "Okay, switching to Korean. From your next question, I'll listen and answer in Korean.", en: "I'm already using English." },
     length: { long: "Okay, I'll give detailed answers until you say short answers.", short: "Okay, back to short answers." },
+    saved: "Saved. Say publish to make it live, or undo to reverse it.",
+    readOnly: (p) => `${p} is read-only, so there's nothing to undo or publish.`,
+    nothingToUndo: "The last change wasn't made by voice, so I won't undo it.",
+    undone: (what) => `Undid: ${what}.`,
+    nothingToPublish: "Everything is already published.",
+    published: (n) => `Published ${n} change${n === 1 ? "" : "s"}. It should be live in a minute or two.`,
+    noRemote: "This project isn't connected to GitHub, so I can't publish it.",
+    gitFailed: "That didn't work. Check the server log on the PC.",
+    unpublishedList: (list) => list.length ? `${list.length} change${list.length === 1 ? " isn't" : "s aren't"} published yet: ${list.join("; ")}.` : "Everything is published.",
   },
   ko: {
     empty: "아무 말도 못 들었어요. 다시 말해 주세요.",
@@ -67,6 +77,15 @@ const MSG = {
     reset: "알겠어요, 새 대화를 시작할게요.",
     switchLanguage: { en: "알겠어요, 다음 질문부터는 영어로 듣고 대답할게요.", ko: "이미 한국어로 하고 있어요." },
     length: { long: "알겠어요, 짧게라고 하실 때까지 자세하게 대답할게요.", short: "알겠어요, 다시 짧게 대답할게요." },
+    saved: "저장했어요. 올리려면 배포, 되돌리려면 되돌려라고 말해 주세요.",
+    readOnly: (p) => `${p}는 읽기 전용이라 되돌리거나 배포할 게 없어요.`,
+    nothingToUndo: "마지막 변경은 음성으로 한 게 아니라서 되돌리지 않을게요.",
+    undone: (what) => `되돌렸어요: ${what}.`,
+    nothingToPublish: "이미 다 배포돼 있어요.",
+    published: (n) => `변경 ${n}개를 배포했어요. 1~2분 안에 반영될 거예요.`,
+    noRemote: "이 프로젝트는 GitHub에 연결돼 있지 않아서 배포할 수 없어요.",
+    gitFailed: "잘 안 됐어요. PC의 서버 로그를 확인해 주세요.",
+    unpublishedList: (list) => list.length ? `아직 배포 안 된 변경이 ${list.length}개 있어요: ${list.join("; ")}.` : "모두 배포돼 있어요.",
   },
 };
 
@@ -141,17 +160,69 @@ function claudeCommand() {
   return candidates.find((c) => fs.existsSync(c)) || "claude";
 }
 
+// ---------- git (voice coding) ----------
+//
+// Only projects with "edit": true in config.json may change files, and only if they're
+// git repos. Each change Claude makes is committed locally as "Voice: <question>", so
+// "undo" can reverse it; nothing leaves the PC until the user says "publish" (git push).
+
+const gitRaw = (project, args) =>
+  execFileSync("git", args, { cwd: project.path, encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+const git = (project, args) => gitRaw(project, args).trim();
+
+function isGitRepo(project) {
+  try { return git(project, ["rev-parse", "--is-inside-work-tree"]) === "true"; } catch { return false; }
+}
+
+const canEdit = (project) => !!project.edit && isGitRepo(project);
+
+// Snapshot of uncommitted files: path -> "status:contentHash". Comparing two snapshots
+// tells which files Claude touched, including ones that were already modified before.
+function dirtyFiles(project) {
+  // Not trimmed: each entry starts with a two-character status that may begin with a space.
+  const out = gitRaw(project, ["-c", "core.quotepath=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const files = new Map();
+  const entries = out.split("\0").filter(Boolean);
+  for (let i = 0; i < entries.length; i++) {
+    const code = entries[i].slice(0, 2), file = entries[i].slice(3);
+    if (code[0] === "R" || code[0] === "C") i++; // renames carry the old path as the next entry
+    let hash = "gone";
+    try { hash = crypto.createHash("sha1").update(fs.readFileSync(path.join(project.path, file))).digest("hex"); } catch {}
+    files.set(file, code + ":" + hash);
+  }
+  return files;
+}
+
+// Commits the files that changed between two snapshots. Returns true if a commit was made.
+function commitChanges(project, before, after, question) {
+  const changed = [...new Set([...before.keys(), ...after.keys()])].filter((f) => before.get(f) !== after.get(f));
+  if (!changed.length) return false;
+  const subject = "Voice: " + question.replace(/\s+/g, " ").slice(0, 72);
+  git(project, ["add", "-A", "--", ...changed]);
+  git(project, ["commit", "-q", "-m", subject, "--", ...changed]);
+  console.log(`  committed ${changed.length} file(s): ${changed.join(", ")}`);
+  return true;
+}
+
+const lastSubject = (project) => git(project, ["log", "-1", "--format=%s"]);
+// Commits on this branch that aren't on GitHub yet (null if the branch has no upstream).
+function unpublished(project) {
+  try { return git(project, ["log", "@{u}..HEAD", "--format=%s"]).split("\n").filter(Boolean); } catch { return null; }
+}
+
 // Runs one Claude turn. Resolves as soon as the final result arrives
 // (the CLI takes another ~1.5s to exit, which we don't wait for).
 // opts: { lang: "en" | "ko", length: "short" | "long" }
 function runClaude(project, text, resume, { lang, length }) {
   return new Promise((resolve) => {
-    const canEdit = config.permissionMode && config.permissionMode !== "default" && config.permissionMode !== "plan";
-    const prompt = SYSTEM_PROMPT + LENGTH_PROMPT[length] + LANGUAGE_PROMPT[lang] + (canEdit
-      ? " You may edit files; after any change, say in one sentence what you changed."
+    const mode = canEdit(project) ? "acceptEdits" : "default";
+    const prompt = SYSTEM_PROMPT + LENGTH_PROMPT[length] + LANGUAGE_PROMPT[lang] + (mode === "acceptEdits"
+      ? " You may edit files in this project. Do not run git or other shell commands: the voice app saves each change " +
+        "automatically, the user says 'publish' to make saved changes live and 'undo' to reverse the last one. " +
+        "After any change, say in one sentence what you changed."
       : " In this mode you can read files but cannot edit them or run commands. If asked to change something, say so plainly and describe the change instead of claiming you made it.");
-    const args = ["-p", "--output-format", "stream-json", "--verbose", "--append-system-prompt", prompt];
-    if (config.permissionMode) args.push("--permission-mode", config.permissionMode);
+    const args = ["-p", "--output-format", "stream-json", "--verbose", "--append-system-prompt", prompt,
+                  "--permission-mode", mode];
     if (config.model) args.push("--model", config.model);
     if (config.effort) args.push("--effort", config.effort);
     if (resume) args.push("--resume", resume);
@@ -250,6 +321,50 @@ function handleCommand(text) {
     saveState();
     return m.length[state.answerLength];
   }
+
+  // Voice coding: "undo", "publish", "what's unpublished?" (and Korean equivalents)
+  const isUndo = /^(undo|undo (that|it|the last change)|revert (that|it|the last change))$/i.test(lengthCmd) || /^(되돌려|되돌려줘|되돌리기|취소해|취소해줘|실행 취소)$/.test(lengthCmd);
+  const isPublish = /^(publish|push|deploy|go live|ship it|publish (it|that|the changes|changes)|push (it|that|the changes))( please)?$/i.test(lengthCmd) || /^(배포|배포해|배포해줘|올려|올려줘|푸시해|푸시해줘|게시해|게시해줘)$/.test(lengthCmd);
+  const isPending = /^(what('s| is) (unpublished|not published)|what changes are (unpublished|not published)|unpublished changes|what did you change)$/i.test(lengthCmd) || /(배포 안 된|안 올린|뭐 바꿨|뭘 바꿨)/.test(lengthCmd);
+  if (isUndo || isPublish || isPending) {
+    const project = currentProject();
+    if (!canEdit(project)) return m.readOnly(spokenName(project));
+    if (busy.has(project.name)) return m.busy;
+    try {
+      if (isPending) {
+        const list = unpublished(project);
+        const describe = (s) => {
+          const reverted = s.match(/^Revert "(?:Voice: )?(.*)"$/);
+          const what = (reverted ? reverted[1] : s.replace(/^Voice: /, "")).replace(/[.!?]+$/, "");
+          return reverted ? (language() === "ko" ? `되돌림: ${what}` : `undo of ${what}`) : what;
+        };
+        return list === null ? m.noRemote : m.unpublishedList(list.map(describe));
+      }
+      if (isUndo) {
+        const subject = lastSubject(project);
+        if (!subject.startsWith("Voice: ")) return m.nothingToUndo;
+        // Not on GitHub yet: drop the commit entirely. Already published: add a commit that reverses it.
+        const local = (unpublished(project) || []).length > 0;
+        git(project, local ? ["reset", "--keep", "HEAD~1"] : ["revert", "--no-edit", "HEAD"]);
+        console.log(`  undo (${local ? "reset" : "revert"}): ${subject}`);
+        // Claude's conversation still remembers making this change; tell it on the next question.
+        state.notes = state.notes || {};
+        state.notes[project.name] = (state.notes[project.name] || "") +
+          `[Note from the voice app: the user said "undo", so your change for "${subject.replace(/^Voice: /, "")}" was reverted. The files no longer contain it.] `;
+        saveState();
+        return m.undone(subject.replace(/^Voice: /, "").replace(/[.!?]+$/, ""));
+      }
+      const list = unpublished(project);
+      if (list === null) return m.noRemote;
+      if (!list.length) return m.nothingToPublish;
+      git(project, ["push", "-q"]);
+      console.log(`  published ${list.length} commit(s) in ${project.name}`);
+      return m.published(list.length);
+    } catch (e) {
+      console.error(`  git failed in ${project.name}: ${String(e.stderr || e.message).trim()}`);
+      return m.gitFailed;
+    }
+  }
   const names = () => config.projects.map((p) => spokenName(p)).join(language() === "ko" ? ", " : " and ");
   const switchTo = (p) => {
     state.lastProject = p.name;
@@ -344,7 +459,8 @@ http.createServer(async (req, res) => {
   // and an English voice reading Korean (or the reverse) comes out as gibberish.
   const lang = language();
   // "In detail, …" / "자세히 …" makes just this answer long; otherwise use the saved mode.
-  const oneOffLong = /^(in detail|in depth|explain in detail|detailed|tell me in detail)\b/i.test(text) || /^(자세히|자세하게)/.test(text);
+  const oneOffLong = /\b(in detail|in depth|detailed (answer|explanation|rundown)|explain (it |this |that )?(fully|thoroughly)|walk me through)\b/i.test(text) ||
+    /^detailed\b/i.test(text) || /(자세히|자세하게|상세하게|자세한 설명)/.test(text);
   const length = oneOffLong || state.answerLength === "long" ? "long" : "short";
   const project = currentProject();
   if (busy.has(project.name)) return reply(res, 200, MSG[lang].busy);
@@ -352,8 +468,20 @@ http.createServer(async (req, res) => {
   const started = Date.now();
   console.log(`[${new Date().toISOString()}] ${project.name} (${lang}, ${length}): ${text}`);
   try {
-    const r = await askClaude(project, text, { lang, length });
-    const spoken = toSpeech(r.reply || MSG[lang].noAnswer);
+    const editing = canEdit(project);
+    const before = editing ? dirtyFiles(project) : null;
+    const note = (state.notes && state.notes[project.name]) || "";
+    const r = await askClaude(project, note + text, { lang, length });
+    if (note && r.ok) { delete state.notes[project.name]; saveState(); }
+    let spoken = toSpeech(r.reply || MSG[lang].noAnswer);
+    if (editing) {
+      try {
+        if (commitChanges(project, before, dirtyFiles(project), text)) spoken += " " + MSG[lang].saved;
+      } catch (e) {
+        console.error(`  saving changes failed in ${project.name}: ${String(e.stderr || e.message).trim()}`);
+        spoken += " " + MSG[lang].gitFailed;
+      }
+    }
     console.log(`  -> ${((Date.now() - started) / 1000).toFixed(1)}s${r.ok ? "" : " (error)"}`);
     appendLog("conversations.log", `[${new Date().toLocaleString()}] ${spokenName(project)}\nQ: ${text}\nA: ${spoken}\n`);
     reply(res, 200, spoken);

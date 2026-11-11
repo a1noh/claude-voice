@@ -1,17 +1,11 @@
 {
   "port": 8787,
-  "permissionMode": "default",
   "model": "sonnet",
   "effort": "low",
   "timeoutSeconds": 300,
   "tailscaleUsers": ["you@example.com"],
   "projects": [
-    {
-      "name": "My Project",
-      "path": "C:\\path\\to\\project",
-      "aliases": [
-        "my project"
-      ]
-    }
+    { "name": "My App", "path": "C:\\path\\to\\my-app", "aliases": ["my app"], "edit": true },
+    { "name": "Notes", "path": "C:\\path\\to\\notes", "aliases": ["notes"] }
   ]
 }

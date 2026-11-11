@@ -189,20 +189,31 @@ The conversations are normal Claude Code sessions, so you can continue one at yo
 
 ---
 
-## Letting it edit code
+## Voice coding (editing files)
 
-By default it is **read-only**: Claude reads your files and answers, and if you ask it to change something, it says what it *would* change.
+By default every project is **read-only**: Claude reads your files and answers, and if you ask it to change something,
+it says what it *would* change.
 
-To let it edit files, set this in `config.json`:
+To let Claude edit a project, add `"edit": true` to it in `config.json`. The project **must be a git repository**
+(editing stays off otherwise), because every change is saved as a git commit so it can be undone:
 
 ```json
-"permissionMode": "acceptEdits"
+{ "name": "My App", "path": "C:\\code\\my-app", "aliases": ["my app"], "edit": true }
 ```
 
-Claude can then create and change files, and tells you in one sentence what it changed. It still **can't run commands**
-(installs, tests, git push), because nobody is there to approve them from the phone.
+Then just ask: *"Change the page title to Hello"*, *"Make the header blue"*, *"Add a footer with the year"*.
 
-Only do this in projects that use **git**, so you can review and undo changes at your desk (`git diff`, `git restore`).
+| Say | What happens |
+|---|---|
+| *(any change request)* | Claude edits the files and says what it changed. The server commits **only the files Claude touched** as `Voice: <your request>`, on your computer only. |
+| "Undo" / "되돌려" | Reverses the last voice change. Claude is told on your next question, so it doesn't think the change is still there. |
+| "What's unpublished?" / "뭐 바꿨어?" | Lists the voice changes that aren't on GitHub yet |
+| "Publish" / "배포" | `git push`, so the changes go live (e.g. GitHub Pages). **Nothing leaves your computer until you say this.** |
+
+Claude still **can't run commands** (installs, tests, git), because nobody is there to approve them from the phone.
+Saving and publishing are done by the server itself, only when you ask. Review the history at your desk anytime with `git log`.
+
+Edits take longer than questions (about 10–20 seconds).
 
 ---
 
@@ -214,8 +225,7 @@ Only do this in projects that use **git**, so you can review and undo changes at
 |---|---|---|
 | `port` | `8787` | Local port (must match `tailscale serve`) |
 | `tailscaleUsers` | — | Tailscale logins allowed to use it |
-| `projects` | — | `name`, `path`, `aliases` for each project |
-| `permissionMode` | `default` | `default` = read-only, `acceptEdits` = can edit files |
+| `projects` | — | `name`, `path`, `aliases`, and `edit: true` to allow voice coding (git repos only) |
 | `model` | `sonnet` | Claude model (`sonnet`, `opus`, `haiku`, …) |
 | `effort` | `low` | Thinking effort: `low` is fastest; raise it for harder questions |
 | `timeoutSeconds` | `300` | Give up on a question after this long |
