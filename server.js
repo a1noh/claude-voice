@@ -19,8 +19,46 @@ const LOG_DIR = path.join(ROOT, "logs");
 const SYSTEM_PROMPT =
   "You are being used through a voice interface while the user may be walking or driving. " +
   "Your final reply will be read aloud by text-to-speech. Reply in 1-3 short spoken sentences, " +
-  "no markdown, no code blocks, no lists, no file paths unless essential. Lead with the answer or outcome. " +
-  "Always reply in English, even if the question or the project files are in another language.";
+  "no markdown, no code blocks, no lists, no file paths unless essential. Lead with the answer or outcome.";
+
+const LANGUAGE_PROMPT = {
+  en: " Always reply in English, even if the question or the project files are in another language.",
+  ko: " Always reply in natural spoken Korean (한국어), even if the question or the project files are in English. Keep code identifiers as they are.",
+};
+
+// Fixed replies, in both languages.
+const MSG = {
+  en: {
+    empty: "I didn't hear anything. Try again.",
+    tooLong: "That was too long. Try a shorter question.",
+    busy: "I'm still working on your last question. Try again in a moment.",
+    busyReset: "I'm still answering your last question. Say new conversation again when it's done.",
+    noAnswer: "I don't have an answer.",
+    timeout: "That took too long, so I stopped. Try a shorter question.",
+    crashed: "Claude couldn't start on the PC. Check the server log.",
+    unknownProject: (names) => `I don't know that project. You have ${names}.`,
+    switched: (p) => `Switched to ${p}.`,
+    current: (p) => `You're on ${p}.`,
+    list: (names) => `Your projects are ${names}.`,
+    reset: "Okay, starting a fresh conversation.",
+    switchLanguage: { ko: "Okay, switching to Korean. From your next question, I'll listen and answer in Korean.", en: "I'm already using English." },
+  },
+  ko: {
+    empty: "아무 말도 못 들었어요. 다시 말해 주세요.",
+    tooLong: "너무 길어요. 더 짧게 물어봐 주세요.",
+    busy: "아직 지난 질문에 답하는 중이에요. 잠시 후에 다시 물어봐 주세요.",
+    busyReset: "아직 지난 질문에 답하는 중이에요. 끝나면 다시 새 대화라고 말해 주세요.",
+    noAnswer: "답을 찾지 못했어요.",
+    timeout: "너무 오래 걸려서 멈췄어요. 더 짧게 물어봐 주세요.",
+    crashed: "PC에서 Claude를 시작하지 못했어요. 서버 로그를 확인해 주세요.",
+    unknownProject: (names) => `그런 프로젝트는 없어요. ${names} 중에서 골라 주세요.`,
+    switched: (p) => `${p}로 바꿨어요.`,
+    current: (p) => `지금은 ${p} 프로젝트예요.`,
+    list: (names) => `프로젝트는 ${names} 중에서 고를 수 있어요.`,
+    reset: "알겠어요, 새 대화를 시작할게요.",
+    switchLanguage: { en: "알겠어요, 다음 질문부터는 영어로 듣고 대답할게요.", ko: "이미 한국어로 하고 있어요." },
+  },
+};
 
 // ---------- files ----------
 
@@ -50,16 +88,23 @@ if (!config) {
   process.exit(1);
 }
 
-// state.json: { sessions: { [projectName]: claudeSessionId }, lastProject }
+// state.json: { sessions: { [projectName]: claudeSessionId }, lastProject, language: "en" | "ko" }
 const state = loadJson(STATE_PATH, {});
 state.sessions = state.sessions || {};
 const saveState = () => fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
 
 const busy = new Set(); // projects with a question in progress
 
+// ---------- language ----------
+
+const language = () => (state.language || config.language) === "ko" ? "ko" : "en";
+const hasKorean = (s) => /[가-힣]/.test(s);
+
 // ---------- projects ----------
 
-const spokenName = (p) => (p.aliases && p.aliases[0]) || p.name;
+// In Korean, a project with a Korean name is called by that name; otherwise by its first alias.
+const spokenName = (p, lang = language()) =>
+  lang === "ko" && hasKorean(p.name) ? p.name : (p.aliases && p.aliases[0]) || p.name;
 const normalize = (s) => String(s).toLowerCase().replace(/[^a-z0-9가-힣 ]/g, "").trim();
 
 function findProject(query) {
@@ -87,10 +132,10 @@ function claudeCommand() {
 
 // Runs one Claude turn. Resolves as soon as the final result arrives
 // (the CLI takes another ~1.5s to exit, which we don't wait for).
-function runClaude(project, text, resume) {
+function runClaude(project, text, resume, lang) {
   return new Promise((resolve) => {
     const canEdit = config.permissionMode && config.permissionMode !== "default" && config.permissionMode !== "plan";
-    const prompt = SYSTEM_PROMPT + (canEdit
+    const prompt = SYSTEM_PROMPT + LANGUAGE_PROMPT[lang] + (canEdit
       ? " You may edit files; after any change, say in one sentence what you changed."
       : " In this mode you can read files but cannot edit them or run commands. If asked to change something, say so plainly and describe the change instead of claiming you made it.");
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--append-system-prompt", prompt];
@@ -113,7 +158,7 @@ function runClaude(project, text, resume) {
     };
     const timer = setTimeout(() => {
       child.kill();
-      finish({ ok: false, reply: "That took too long, so I stopped. Try a shorter question." });
+      finish({ ok: false, reply: MSG[lang].timeout });
     }, (config.timeoutSeconds || 300) * 1000);
 
     child.stdout.on("data", (chunk) => {
@@ -135,7 +180,7 @@ function runClaude(project, text, resume) {
     const crashed = (why) => {
       if (done) return;
       console.error(`  claude failed (${why}): ${stderr.trim().slice(-500)}`);
-      finish({ ok: false, crashed: true, reply: "Claude couldn't start on the PC. Check the server log." });
+      finish({ ok: false, crashed: true, reply: MSG[lang].crashed });
     };
     child.on("error", (e) => crashed(e.message));
     child.on("close", (code) => crashed(`exit ${code}`));
@@ -145,14 +190,14 @@ function runClaude(project, text, resume) {
 
 // Continues the project's conversation. If the saved conversation can't be
 // resumed (deleted, corrupted, Claude Code update), starts a fresh one instead.
-async function askClaude(project, text) {
+async function askClaude(project, text, lang) {
   const saved = state.sessions[project.name];
-  let r = await runClaude(project, text, saved);
+  let r = await runClaude(project, text, saved, lang);
   // Only a CLI failure (no answer at all) means the resume itself broke. Timeouts and
   // Claude-side errors (e.g. usage limit) keep the conversation and aren't retried.
   if (r.crashed && saved) {
     console.log(`  resume failed for ${project.name}, starting a fresh conversation`);
-    r = await runClaude(project, text, null);
+    r = await runClaude(project, text, null, lang);
   }
   if (r.sessionId) {
     state.sessions[project.name] = r.sessionId;
@@ -163,9 +208,26 @@ async function askClaude(project, text) {
 
 // ---------- voice commands ----------
 
-// Returns a reply for built-in commands, or null for a normal question.
+// Returns a reply for built-in commands (English or Korean), or null for a normal question.
 function handleCommand(text) {
-  const names = () => config.projects.map(spokenName).join(" and ");
+  // Language: "switch to Korean", "speak English", "한국어로 바꿔", "영어로" ...
+  const toKo = /^((switch|change)( the language)? to|speak|use) korean\b/i.test(text) || /^한국어(로)?(\s|[.!?]|$)/.test(text);
+  const toEn = /^((switch|change)( the language)? to|speak|use) english\b/i.test(text) || /^영어(로)?(\s|[.!?]|$)/.test(text);
+  if (toKo || toEn) {
+    // Confirm in the language that's active now: the Shortcut already chose this voice.
+    const before = language();
+    state.language = toKo ? "ko" : "en";
+    saveState();
+    return MSG[before].switchLanguage[state.language];
+  }
+
+  const m = MSG[language()];
+  const names = () => config.projects.map((p) => spokenName(p)).join(language() === "ko" ? ", " : " and ");
+  const switchTo = (p) => {
+    state.lastProject = p.name;
+    saveState();
+    return m.switched(spokenName(p));
+  };
 
   // "switch to X" is always a command; "change/go to X" only when X is a known project,
   // so requests like "change the header color to blue" still go to Claude.
@@ -173,19 +235,20 @@ function handleCommand(text) {
   if (sw) {
     const p = findProject(sw[2]);
     if (!p && sw[1].toLowerCase() !== "switch") return null;
-    if (!p) return `I don't know that project. You have ${names()}.`;
-    state.lastProject = p.name;
-    saveState();
-    return `Switched to ${spokenName(p)}.`;
+    return p ? switchTo(p) : m.unknownProject(names());
   }
-  if (/^(which|what) project\b/i.test(text)) return `You're on ${spokenName(currentProject())}.`;
-  if (/^(list|what are) (my |the )?projects\b/i.test(text)) return `Your projects are ${names()}.`;
-  if (/^(new conversation|start over|start fresh|reset)[.!]*$/i.test(text)) {
+  // Korean: "헤르메스로 바꿔", "윈투 프로젝트로 전환해" (only when it names a known project)
+  const ko = text.match(/^(.+?)\s*(?:프로젝트)?\s*(?:으로|로)\s*(?:바꿔|전환|이동|변경)/);
+  if (ko && findProject(ko[1])) return switchTo(findProject(ko[1]));
+
+  if (/^(which|what) project\b/i.test(text) || /(어떤|무슨|어느)\s*프로젝트/.test(text)) return m.current(spokenName(currentProject()));
+  if (/^(list|what are) (my |the )?projects\b/i.test(text) || /프로젝트\s*(목록|리스트|뭐\s*있)/.test(text)) return m.list(names());
+  if (/^(new conversation|start over|start fresh|reset)[.!]*$/i.test(text) || /^(새\s*대화|새로\s*시작|처음부터)/.test(text)) {
     // A running question would write its session back afterwards and undo the reset.
-    if (busy.has(currentProject().name)) return "I'm still answering your last question. Say new conversation again when it's done.";
+    if (busy.has(currentProject().name)) return m.busyReset;
     delete state.sessions[currentProject().name];
     saveState();
-    return "Okay, starting a fresh conversation.";
+    return m.reset;
   }
   return null;
 }
@@ -230,28 +293,35 @@ function toSpeech(text) {
 http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   if (req.method === "GET" && url.pathname === "/") return reply(res, 200, "Voice Claude is running.");
-  if (!(req.method === "POST" && url.pathname === "/api/shortcut")) return reply(res, 404, "Not found.");
+  const isAsk = req.method === "POST" && url.pathname === "/api/shortcut";
+  const isLang = req.method === "GET" && url.pathname === "/api/language";
+  if (!isAsk && !isLang) return reply(res, 404, "Not found.");
   if (!isAllowed(req)) return reply(res, 401, "Not allowed. Connect Tailscale with your own account.");
 
   config = loadJson(CONFIG_PATH, config); // pick up config edits without a restart
+  // The Shortcut asks this first to pick its dictation and voice language: "en" or "ko".
+  if (isLang) return reply(res, 200, language());
+
   const body = await readBody(req);
-  if (body === null) return reply(res, 413, "That was too long. Try a shorter question.");
+  if (body === null) return reply(res, 413, MSG[language()].tooLong);
   let text;
   try { text = JSON.parse(body).text; } catch { text = body; }
   text = String(text || "").trim();
-  if (!text) return reply(res, 200, "I didn't hear anything. Try again.");
+  if (!text) return reply(res, 200, MSG[language()].empty);
 
   const command = handleCommand(text);
   if (command) return reply(res, 200, command);
 
+  // Answer in the chosen language; a question asked in Korean always gets a Korean answer.
+  const lang = hasKorean(text) ? "ko" : language();
   const project = currentProject();
-  if (busy.has(project.name)) return reply(res, 200, "I'm still working on your last question. Try again in a moment.");
+  if (busy.has(project.name)) return reply(res, 200, MSG[lang].busy);
   busy.add(project.name);
   const started = Date.now();
-  console.log(`[${new Date().toISOString()}] ${project.name}: ${text}`);
+  console.log(`[${new Date().toISOString()}] ${project.name} (${lang}): ${text}`);
   try {
-    const r = await askClaude(project, text);
-    const spoken = toSpeech(r.reply || "I don't have an answer.");
+    const r = await askClaude(project, text, lang);
+    const spoken = toSpeech(r.reply || MSG[lang].noAnswer);
     console.log(`  -> ${((Date.now() - started) / 1000).toFixed(1)}s${r.ok ? "" : " (error)"}`);
     appendLog("conversations.log", `[${new Date().toLocaleString()}] ${spokenName(project)}\nQ: ${text}\nA: ${spoken}\n`);
     reply(res, 200, spoken);

@@ -161,6 +161,24 @@ Ask anything about the current project:
 | "List projects" | Lists your projects |
 | "New conversation" | The next question starts a fresh conversation for this project |
 
+### English and Korean (한국어)
+
+Say **"Switch to Korean"** to have it listen and answer in Korean. In Korean mode, say **"영어로"** to go back.
+The setting is remembered. Korean commands also work: "헤르메스로 바꿔", "어떤 프로젝트야?", "프로젝트 목록", "새 대화".
+
+For this, the Shortcut has to ask the computer which language is active (`GET /api/language` returns `en` or `ko`)
+and pick its dictation and voice language from that. Build it like this instead of the 3-step version:
+
+1. **Get Contents of URL** `https://<your address>/api/language` (method GET), then **Set Variable** `Lang` to it.
+2. **If** `Lang` **is** `ko` → **Dictate Text** (Korean, On Tap). **Otherwise** → **Dictate Text** (English (US), On Tap). **End If**
+3. **Get Contents of URL** `https://<your address>/api/shortcut`, POST, JSON, field `text` = **If Result**
+4. **If** `Lang` **is** `ko` → **Speak Text** (Korean). **Otherwise** → **Speak Text** (English (US)). **End If**
+
+Or tap **+** and describe it:
+*"Get contents of URL `<your address>/api/language` and set a variable named Lang to it. If Lang is ko, dictate text in Korean, otherwise dictate text in English (US), and stop listening on tap in both. Then get contents of URL `<your address>/api/shortcut` using POST with a JSON body with a text field named "text" set to the dictated text. Then if Lang is ko, speak the contents of that URL in Korean, otherwise speak it in English (US), and wait until finished."*
+
+A question asked in Korean always gets a Korean answer, whatever the setting.
+
 Every question and answer is also saved on your computer in `logs/conversations.log`.
 The conversations are normal Claude Code sessions, so you can continue one at your desk with `claude --resume` in the project folder.
 
@@ -252,7 +270,7 @@ Logs live in `logs/`: `server.log` (requests, timings, errors) and `conversation
 
 - **Waits for the full answer** before speaking (Shortcuts can't stream). Short answers take about 5 seconds.
 - **One question per press.** Press again for a follow-up; it remembers the conversation.
-- **English** speech in and out. Change the Dictate Text language and the prompt in `server.js` for other languages.
+- **English and Korean** built in. Other languages need a new entry in `LANGUAGE_PROMPT` and `MSG` in `server.js`.
 - Every question uses your Claude plan's usage, like any Claude Code message.
 
 ---
