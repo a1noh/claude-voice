@@ -18,8 +18,14 @@ const LOG_DIR = path.join(ROOT, "logs");
 
 const SYSTEM_PROMPT =
   "You are being used through a voice interface while the user may be walking or driving. " +
-  "Your final reply will be read aloud by text-to-speech. Reply in 1-3 short spoken sentences, " +
-  "no markdown, no code blocks, no lists, no file paths unless essential. Lead with the answer or outcome.";
+  "Your final reply will be read aloud by text-to-speech: no markdown, no code blocks, no lists, " +
+  "no file paths unless essential. Lead with the answer or outcome.";
+
+const LENGTH_PROMPT = {
+  short: " Reply in 1-3 short spoken sentences.",
+  long: " Give a thorough spoken explanation of about 30 to 60 seconds (roughly 80 to 150 words), " +
+        "in plain sentences that are easy to follow by ear. Instead of lists, use words like first, then, and finally.",
+};
 
 const LANGUAGE_PROMPT = {
   en: " Always reply in English, even if the question or the project files are in another language; the voice reading your reply can only pronounce English." +
@@ -44,6 +50,7 @@ const MSG = {
     list: (names) => `Your projects are ${names}.`,
     reset: "Okay, starting a fresh conversation.",
     switchLanguage: { ko: "Okay, switching to Korean. From your next question, I'll listen and answer in Korean.", en: "I'm already using English." },
+    length: { long: "Okay, I'll give detailed answers until you say short answers.", short: "Okay, back to short answers." },
   },
   ko: {
     empty: "아무 말도 못 들었어요. 다시 말해 주세요.",
@@ -59,6 +66,7 @@ const MSG = {
     list: (names) => `프로젝트는 ${names} 중에서 고를 수 있어요.`,
     reset: "알겠어요, 새 대화를 시작할게요.",
     switchLanguage: { en: "알겠어요, 다음 질문부터는 영어로 듣고 대답할게요.", ko: "이미 한국어로 하고 있어요." },
+    length: { long: "알겠어요, 짧게라고 하실 때까지 자세하게 대답할게요.", short: "알겠어요, 다시 짧게 대답할게요." },
   },
 };
 
@@ -90,7 +98,8 @@ if (!config) {
   process.exit(1);
 }
 
-// state.json: { sessions: { [projectName]: claudeSessionId }, lastProject, language: "en" | "ko" }
+// state.json: { sessions: { [projectName]: claudeSessionId }, lastProject,
+//               language: "en" | "ko", answerLength: "short" | "long" }
 const state = loadJson(STATE_PATH, {});
 state.sessions = state.sessions || {};
 const saveState = () => fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
@@ -134,10 +143,11 @@ function claudeCommand() {
 
 // Runs one Claude turn. Resolves as soon as the final result arrives
 // (the CLI takes another ~1.5s to exit, which we don't wait for).
-function runClaude(project, text, resume, lang) {
+// opts: { lang: "en" | "ko", length: "short" | "long" }
+function runClaude(project, text, resume, { lang, length }) {
   return new Promise((resolve) => {
     const canEdit = config.permissionMode && config.permissionMode !== "default" && config.permissionMode !== "plan";
-    const prompt = SYSTEM_PROMPT + LANGUAGE_PROMPT[lang] + (canEdit
+    const prompt = SYSTEM_PROMPT + LENGTH_PROMPT[length] + LANGUAGE_PROMPT[lang] + (canEdit
       ? " You may edit files; after any change, say in one sentence what you changed."
       : " In this mode you can read files but cannot edit them or run commands. If asked to change something, say so plainly and describe the change instead of claiming you made it.");
     const args = ["-p", "--output-format", "stream-json", "--verbose", "--append-system-prompt", prompt];
@@ -192,14 +202,14 @@ function runClaude(project, text, resume, lang) {
 
 // Continues the project's conversation. If the saved conversation can't be
 // resumed (deleted, corrupted, Claude Code update), starts a fresh one instead.
-async function askClaude(project, text, lang) {
+async function askClaude(project, text, opts) {
   const saved = state.sessions[project.name];
-  let r = await runClaude(project, text, saved, lang);
+  let r = await runClaude(project, text, saved, opts);
   // Only a CLI failure (no answer at all) means the resume itself broke. Timeouts and
   // Claude-side errors (e.g. usage limit) keep the conversation and aren't retried.
   if (r.crashed && saved) {
     console.log(`  resume failed for ${project.name}, starting a fresh conversation`);
-    r = await runClaude(project, text, null, lang);
+    r = await runClaude(project, text, null, opts);
   }
   if (r.sessionId) {
     state.sessions[project.name] = r.sessionId;
@@ -218,7 +228,7 @@ function handleCommand(text) {
   const wantsLang = (en, ko) => text.length <= 120 && (
     new RegExp(`\\b(switch|change|set|speak|talk|use|answer|reply|respond|listen)\\b[^.?!]{0,60}\\b${en}\\b`, "i").test(text) ||
     new RegExp(`^${en}( mode| please)?[.!?]*$`, "i").test(text) ||
-    new RegExp(`^${ko}\\s*(로|으로)?\\s*(바꿔|전환|변경|해|말해|대답|듣고|할게|하자|모드)?`).test(text));
+    (text.length <= 15 && new RegExp(`^${ko}\\s*(로|으로)?\\s*(바꿔|전환|변경|해|말해|대답|듣고|할게|하자|모드)?`).test(text)));
   const toKo = wantsLang("korean", "한국어|한국말");
   const toEn = !toKo && wantsLang("english", "영어");
   if (toKo || toEn) {
@@ -230,6 +240,16 @@ function handleCommand(text) {
   }
 
   const m = MSG[language()];
+
+  // Answer length mode: "long answers" / "short answers", "길게" / "짧게" (the whole request, nothing else)
+  const lengthCmd = text.replace(/[.!?]+$/, "").trim();
+  const toLong = /^(long|longer|detailed|detail)( answers?| mode| answer mode)?( please)?$/i.test(lengthCmd) || /^(길게|자세하게|자세히)( (대답|답변|말)해( 줘|줘)?| 모드)?$/.test(lengthCmd);
+  const toShort = /^(short|shorter|brief)( answers?| mode| answer mode)?( please)?$/i.test(lengthCmd) || /^(짧게|간단하게|간단히)( (대답|답변|말)해( 줘|줘)?| 모드)?$/.test(lengthCmd);
+  if (toLong || toShort) {
+    state.answerLength = toLong ? "long" : "short";
+    saveState();
+    return m.length[state.answerLength];
+  }
   const names = () => config.projects.map((p) => spokenName(p)).join(language() === "ko" ? ", " : " and ");
   const switchTo = (p) => {
     state.lastProject = p.name;
@@ -323,13 +343,16 @@ http.createServer(async (req, res) => {
   // Answer in the active language: the Shortcut already picked a voice for it,
   // and an English voice reading Korean (or the reverse) comes out as gibberish.
   const lang = language();
+  // "In detail, …" / "자세히 …" makes just this answer long; otherwise use the saved mode.
+  const oneOffLong = /^(in detail|in depth|explain in detail|detailed|tell me in detail)\b/i.test(text) || /^(자세히|자세하게)/.test(text);
+  const length = oneOffLong || state.answerLength === "long" ? "long" : "short";
   const project = currentProject();
   if (busy.has(project.name)) return reply(res, 200, MSG[lang].busy);
   busy.add(project.name);
   const started = Date.now();
-  console.log(`[${new Date().toISOString()}] ${project.name} (${lang}): ${text}`);
+  console.log(`[${new Date().toISOString()}] ${project.name} (${lang}, ${length}): ${text}`);
   try {
-    const r = await askClaude(project, text, lang);
+    const r = await askClaude(project, text, { lang, length });
     const spoken = toSpeech(r.reply || MSG[lang].noAnswer);
     console.log(`  -> ${((Date.now() - started) / 1000).toFixed(1)}s${r.ok ? "" : " (error)"}`);
     appendLog("conversations.log", `[${new Date().toLocaleString()}] ${spokenName(project)}\nQ: ${text}\nA: ${spoken}\n`);

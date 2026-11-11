@@ -160,11 +160,16 @@ Ask anything about the current project:
 | "Which project?" | Tells you the current project |
 | "List projects" | Lists your projects |
 | "New conversation" | The next question starts a fresh conversation for this project |
+| "In detail, …" | Just this answer is long (about 30–60 seconds of speech) |
+| "Long answers" / "Short answers" | Switches every answer to long or short. Remembered. |
+
+Answers are 1–3 sentences by default. Long answers take longer before they start playing
+(about 8–12 seconds), because the Shortcut speaks only once the whole answer is ready.
 
 ### English and Korean (한국어)
 
 Say **"Switch to Korean"** to have it listen and answer in Korean. In Korean mode, say **"영어로"** to go back.
-The setting is remembered. Korean commands also work: "헤르메스로 바꿔", "어떤 프로젝트야?", "프로젝트 목록", "새 대화".
+The setting is remembered. Korean commands also work: "헤르메스로 바꿔", "어떤 프로젝트야?", "프로젝트 목록", "새 대화", "자세히 …", "길게" / "짧게".
 
 For this, the Shortcut has to ask the computer which language is active (`GET /api/language` returns `en` or `ko`)
 and pick its dictation and voice language from that. Build it like this instead of the 3-step version:
