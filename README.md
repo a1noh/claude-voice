@@ -266,3 +266,7 @@ Logs live in `logs/`: `server.log` (requests, timings, errors) and `conversation
 3. The reply comes back as plain text, and the Shortcut speaks it.
 4. The session id is saved in `state.json`, so the next question continues the same conversation.
    If a saved conversation can't be resumed, it starts a fresh one automatically.
+
+## License
+
+[MIT](LICENSE)
