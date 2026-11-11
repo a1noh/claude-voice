@@ -22,8 +22,10 @@ const SYSTEM_PROMPT =
   "no markdown, no code blocks, no lists, no file paths unless essential. Lead with the answer or outcome.";
 
 const LANGUAGE_PROMPT = {
-  en: " Always reply in English, even if the question or the project files are in another language.",
-  ko: " Always reply in natural spoken Korean (한국어), even if the question or the project files are in English. Keep code identifiers as they are.",
+  en: " Always reply in English, even if the question or the project files are in another language; the voice reading your reply can only pronounce English." +
+      " You cannot change the voice language yourself: if the user wants Korean, tell them to say 'switch to Korean'.",
+  ko: " Always reply in natural spoken Korean (한국어), even if the question or the project files are in English; the voice reading your reply is Korean. Keep code identifiers as they are." +
+      " You cannot change the voice language yourself: if the user wants English, tell them to say '영어로'.",
 };
 
 // Fixed replies, in both languages.
@@ -211,8 +213,14 @@ async function askClaude(project, text, lang) {
 // Returns a reply for built-in commands (English or Korean), or null for a normal question.
 function handleCommand(text) {
   // Language: "switch to Korean", "speak English", "한국어로 바꿔", "영어로" ...
-  const toKo = /^((switch|change)( the language)? to|speak|use) korean\b/i.test(text) || /^한국어(로)?(\s|[.!?]|$)/.test(text);
-  const toEn = /^((switch|change)( the language)? to|speak|use) english\b/i.test(text) || /^영어(로)?(\s|[.!?]|$)/.test(text);
+  // Matches natural requests too ("can you switch the language to Korean?", "I want to speak
+  // in Korean", "한국어로 바꿔줘"), but only short ones, so real questions about Korean text still reach Claude.
+  const wantsLang = (en, ko) => text.length <= 120 && (
+    new RegExp(`\\b(switch|change|set|speak|talk|use|answer|reply|respond|listen)\\b[^.?!]{0,60}\\b${en}\\b`, "i").test(text) ||
+    new RegExp(`^${en}( mode| please)?[.!?]*$`, "i").test(text) ||
+    new RegExp(`^${ko}\\s*(로|으로)?\\s*(바꿔|전환|변경|해|말해|대답|듣고|할게|하자|모드)?`).test(text));
+  const toKo = wantsLang("korean", "한국어|한국말");
+  const toEn = !toKo && wantsLang("english", "영어");
   if (toKo || toEn) {
     // Confirm in the language that's active now: the Shortcut already chose this voice.
     const before = language();
@@ -312,8 +320,9 @@ http.createServer(async (req, res) => {
   const command = handleCommand(text);
   if (command) return reply(res, 200, command);
 
-  // Answer in the chosen language; a question asked in Korean always gets a Korean answer.
-  const lang = hasKorean(text) ? "ko" : language();
+  // Answer in the active language: the Shortcut already picked a voice for it,
+  // and an English voice reading Korean (or the reverse) comes out as gibberish.
+  const lang = language();
   const project = currentProject();
   if (busy.has(project.name)) return reply(res, 200, MSG[lang].busy);
   busy.add(project.name);
